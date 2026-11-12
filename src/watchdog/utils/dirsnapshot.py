@@ -13,6 +13,13 @@
     the snapshot diff will represent file/directory movement as
     created and deleted events.
 
+    A move inferred from an inode is otherwise only as reliable as
+    the inode itself: recycled inodes and hard links sharing one
+    inode can be misreported as moves. Pass ``conservative=True``
+    to :class:`DirectorySnapshotDiff` to require unambiguous identity
+    evidence for a move; uncertain pairs are then reported as
+    deletion and creation events instead.
+
 Classes
 -------
 .. autoclass:: DirectorySnapshot
@@ -68,6 +75,22 @@ class DirectorySnapshotDiff:
         Set to True only if you are sure you will always use the same device.
     :type ignore_device:
         :class:`bool`
+    :param conservative:
+        A boolean enabling conservative move detection. By default any path that
+        disappeared and any new path sharing the same inode are paired into a
+        move event. This is unsound when an inode is recycled for a freshly
+        created file (and birth time is unavailable) or when several hard links
+        share an inode, in which case the pairing is arbitrary. Consumers that
+        carry state from the old path over to the new one (for example a read
+        offset) would then skip data of the unrelated new file.
+        With ``conservative=True`` a move is only reported when the identity is
+        unambiguous: the inode has a single path in each snapshot and the entry
+        kind matches. When both snapshots know the birth time, it must also be
+        equal; without it, the mtime and size must be unchanged. A move that
+        cannot be proven is emitted as separate deletion and creation events
+        instead.
+    :type conservative:
+        :class:`bool`
     """
 
     def __init__(
@@ -76,6 +99,7 @@ class DirectorySnapshotDiff:
         snapshot: DirectorySnapshot,
         *,
         ignore_device: bool = False,
+        conservative: bool = False,
     ) -> None:
         created = snapshot.paths - ref.paths
         deleted = ref.paths - snapshot.paths
@@ -125,6 +149,67 @@ class DirectorySnapshotDiff:
 
             return True
 
+        if ignore_device and conservative:
+
+            def merged_inode_paths(directory: DirectorySnapshot) -> dict[int, set[bytes | str]]:
+                # With the device ignored, paths from sibling devices sharing an
+                # inode number are indistinguishable; count them together.
+                merged: dict[int, set[bytes | str]] = {}
+                for (ino, _dev), inode_paths in directory._inode_to_paths.items():  # noqa: SLF001
+                    merged.setdefault(ino, set()).update(inode_paths)
+                return merged
+
+            ref_inode_paths = merged_inode_paths(ref)
+            snapshot_inode_paths = merged_inode_paths(snapshot)
+
+            def get_inode_paths(directory: DirectorySnapshot, uid: tuple[int, int]) -> set[bytes | str]:
+                index = ref_inode_paths if directory is ref else snapshot_inode_paths
+                return index.get(uid[0], set())
+
+        else:
+
+            def get_inode_paths(directory: DirectorySnapshot, uid: tuple[int, int]) -> set[bytes | str]:
+                return directory.paths_for_inode(uid)
+
+        def is_proven_move(ref_path: bytes | str, new_path: bytes | str) -> bool:
+            """Decide whether pairing ``ref_path`` with ``new_path`` as a move is
+            backed by unambiguous identity evidence.
+
+            An inode id alone does not prove identity: it may have been recycled
+            for a freshly created file, and several hard links (or followed
+            symlinks) may share it, making any single-path pairing arbitrary.
+            """
+            # Hard links and followed symlinks give one inode several names. The
+            # inode-to-path mapping then remembers an arbitrary one of them, so
+            # no single old path can be paired with a new path with confidence.
+            if len(get_inode_paths(ref, ref.inode(ref_path))) > 1:
+                return False
+            if len(get_inode_paths(snapshot, snapshot.inode(new_path))) > 1:
+                return False
+
+            # A rename cannot change the entry kind (#303).
+            if ref.isdir(ref_path) != snapshot.isdir(new_path):
+                return False
+
+            # Birth time is the strongest identity proof: differing values prove
+            # the inode was recycled for a newly created entry (#992), while
+            # equal values prove the same entry even if mtime and size changed.
+            ref_btime = ref.birthtime(ref_path)
+            new_btime = snapshot.birthtime(new_path)
+            if ref_btime is not None and new_btime is not None:
+                return ref_btime == new_btime
+
+            # Without birth time, fall back to the metadata a plain rename
+            # cannot alter. A recycled inode that happens to keep the same mtime
+            # (for example a file rewritten with a copied timestamp) is a
+            # classic false move; requiring an unchanged size as well makes the
+            # remaining false positives negligible, at the cost of reporting a
+            # genuinely moved-and-modified file as deleted and created.
+            return (
+                ref.mtime(ref_path) == snapshot.mtime(new_path)
+                and ref.size(ref_path) == snapshot.size(new_path)
+            )
+
         # find moved paths
         moved: set[tuple[bytes | str, bytes | str]] = set()
         for path in set(deleted):
@@ -138,6 +223,7 @@ class DirectorySnapshotDiff:
                 new_path
                 and (new_path not in ref.paths or ref.inode(new_path) != inode)
                 and is_same_entry(path, new_path)
+                and (not conservative or is_proven_move(path, new_path))
             ):
                 # file is not deleted but moved
                 deleted.remove(path)
@@ -154,6 +240,7 @@ class DirectorySnapshotDiff:
                 old_path
                 and (old_path not in snapshot.paths or snapshot.inode(old_path) != inode)
                 and is_same_entry(old_path, path)
+                and (not conservative or is_proven_move(old_path, path))
             ):
                 created.remove(path)
                 moved.add((old_path, path))
@@ -323,6 +410,11 @@ class DirectorySnapshotDiff:
             Set to True only if you are sure you will always use the same device.
         :type ignore_device:
             :class:`bool`
+        :param conservative:
+            A boolean enabling conservative move detection. See
+            :class:`DirectorySnapshotDiff` for details.
+        :type conservative:
+            :class:`bool`
         """
 
         def __init__(
@@ -333,12 +425,14 @@ class DirectorySnapshotDiff:
             stat: Callable[[str], os.stat_result] = os.stat,
             listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
             ignore_device: bool = False,
+            conservative: bool = False,
         ) -> None:
             self.path = path
             self.recursive = recursive
             self.stat = stat
             self.listdir = listdir
             self.ignore_device = ignore_device
+            self.conservative = conservative
 
         def __enter__(self) -> None:
             self.pre_snapshot = self.get_snapshot()
@@ -349,6 +443,7 @@ class DirectorySnapshotDiff:
                 self.pre_snapshot,
                 self.post_snapshot,
                 ignore_device=self.ignore_device,
+                conservative=self.conservative,
             )
 
         def get_snapshot(self) -> DirectorySnapshot:
@@ -396,15 +491,22 @@ class DirectorySnapshot:
 
         self._stat_info: dict[bytes | str, os.stat_result] = {}
         self._inode_to_path: dict[tuple[int, int], bytes | str] = {}
+        # Every path sharing an inode (hard links, followed symlinks). The
+        # single-path mapping above only remembers the last entry found, which
+        # is ambiguous as soon as several names point at the same inode.
+        self._inode_to_paths: dict[tuple[int, int], set[bytes | str]] = {}
         self._birthtimes: dict[bytes | str, int | None] = {}
 
         st = self.stat(path)
         self._stat_info[path] = st
-        self._inode_to_path[(st.st_ino, st.st_dev)] = path
+        root_inode = (st.st_ino, st.st_dev)
+        self._inode_to_path[root_inode] = path
+        self._inode_to_paths.setdefault(root_inode, set()).add(path)
 
         for p, st in self.walk(path):
             i = (st.st_ino, st.st_dev)
             self._inode_to_path[i] = p
+            self._inode_to_paths.setdefault(i, set()).add(p)
             self._stat_info[p] = st
 
     def walk(self, root: str) -> Iterator[tuple[str, os.stat_result]]:
@@ -441,6 +543,14 @@ class DirectorySnapshot:
     def path(self, uid: tuple[int, int]) -> bytes | str | None:
         """Returns path for id. None if id is unknown to this snapshot."""
         return self._inode_to_path.get(uid)
+
+    def paths_for_inode(self, uid: tuple[int, int]) -> set[bytes | str]:
+        """Returns every path associated with an inode id.
+
+        A hard link (or a followed symlink) makes several paths share one
+        inode. Returns an empty set if the id is unknown to this snapshot.
+        """
+        return set(self._inode_to_paths.get(uid, ()))
 
     def inode(self, path: bytes | str) -> tuple[int, int]:
         """Returns an id for path."""
@@ -535,6 +645,7 @@ class EmptyDirectorySnapshot(DirectorySnapshot):
 
     def __init__(self) -> None:
         self._stat_info: dict[bytes | str, os.stat_result] = {}
+        self._inode_to_paths: dict[tuple[int, int], set[bytes | str]] = {}
 
     @staticmethod
     def path(_: Any) -> None:
@@ -545,6 +656,13 @@ class EmptyDirectorySnapshot(DirectorySnapshot):
             None.
         """
         return
+
+    @staticmethod
+    def paths_for_inode(_: Any) -> set:
+        """Mock up method to return the paths of the received inode. As the
+        snapshot is intended to be empty, it always returns an empty set.
+        """
+        return set()
 
     @property
     def paths(self) -> set:

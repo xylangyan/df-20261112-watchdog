@@ -305,3 +305,52 @@ def test_hard_link_rename_emits_only_move(p, source, destination):
             events.append(event)
 
     assert events == [FileMovedEvent(p(source), p(destination))]
+
+
+@pytest.mark.parametrize(("source", "destination"), [("a", "c"), ("c", "a")])
+def test_conservative_hard_link_rename_emits_delete_and_create(p, source, destination):
+    # With conservative move detection the ambiguous hard link rename must not
+    # carry a read offset over through a move event: the emitter reports a
+    # deletion and a creation instead.
+    touch(p(source))
+    try:
+        os.link(p(source), p("b"))
+    except OSError as e:
+        pytest.skip(f"Hard links are unavailable: {e}")
+
+    def listdir(path):
+        with os.scandir(path) as entries:
+            yield from sorted(entries, key=lambda entry: entry.name)
+
+    queue = Queue()
+    emitter = Emitter(queue, ObservedWatch(p(""), recursive=True), listdir=listdir, conservative=True)
+    emitter.on_thread_start()
+    mv(p(source), p(destination))
+    emitter.queue_events(0)
+    events = []
+    while not queue.empty():
+        event, _ = queue.get_nowait()
+        if not event.is_directory:
+            events.append(event)
+
+    assert FileMovedEvent(p(source), p(destination)) not in events
+    assert FileDeletedEvent(p(source)) in events
+    assert FileCreatedEvent(p(destination)) in events
+
+
+def test_conservative_real_rename_still_emits_move(p):
+    touch(p("a"))
+    queue = Queue()
+    emitter = Emitter(queue, ObservedWatch(p(""), recursive=True), conservative=True)
+    emitter.on_thread_start()
+    mv(p("a"), p("b"))
+    emitter.queue_events(0)
+    events = []
+    while not queue.empty():
+        event, _ = queue.get_nowait()
+        if not event.is_directory:
+            events.append(event)
+
+    assert FileMovedEvent(p("a"), p("b")) in events
+    assert FileCreatedEvent(p("b")) not in events
+    assert FileDeletedEvent(p("a")) not in events

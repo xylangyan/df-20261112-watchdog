@@ -442,3 +442,161 @@ def test_hard_link_rename_has_no_duplicate_create_or_delete(p, ignore_device, so
     assert diff.files_moved == [(p(source), p(destination))]
     assert diff.files_deleted == []
     assert diff.files_created == []
+
+
+def test_conservative_defaults_to_legacy_detection(p: Any) -> None:
+    # The conservative mode is opt-in: by default (and with an explicit False)
+    # the ambiguity is still resolved into a move, as it always was.
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 20, 1000, False)})
+    assert DirectorySnapshotDiff(ref, snapshot).files_moved == [(p("old"), p("new"))]
+    assert DirectorySnapshotDiff(ref, snapshot, conservative=False).files_moved == [(p("old"), p("new"))]
+    assert DirectorySnapshotDiff(ref, snapshot, conservative=True).files_moved == []
+
+
+def test_conservative_keeps_real_move(p: Any) -> None:
+    # Pair 1/3: a genuine same-device rename keeps a unique inode, size and
+    # mtime, so the conservative diff still reports exactly one move.
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 10, 1000, False)})
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == [(p("old"), p("new"))]
+    assert diff.files_deleted == []
+    assert diff.files_created == []
+
+
+def test_conservative_splits_inode_reuse_with_equal_mtime(p: Any) -> None:
+    # Pair 2/3: a deleted file and a newly created file that took over the same
+    # inode and was even given the same mtime must not be paired when their
+    # sizes differ. A collector would otherwise reuse the old read offset on an
+    # unrelated file and lose data.
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 20, 1000, False)})
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == []
+    assert diff.files_deleted == [p("old")]
+    assert diff.files_created == [p("new")]
+
+
+def test_conservative_splits_inode_reuse_when_mtime_differs(p: Any) -> None:
+    # The same identity doubt holds when the size matches but the mtime does
+    # not: without birth time, that metadata cannot be proven to survive a
+    # rename, so a delete and a create are reported instead.
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 10, 2000, False)})
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == []
+    assert diff.files_deleted == [p("old")]
+    assert diff.files_created == [p("new")]
+
+
+def test_conservative_accepts_move_with_equal_birthtime(p: Any) -> None:
+    # Birth time is a strong identity proof: equal values keep the move even if
+    # the move also modified the file.
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False, 500.0)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 30, 2000, False, 500.0)})
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == [(p("old"), p("new"))]
+    assert diff.files_modified == [p("old")]
+    assert diff.files_deleted == []
+    assert diff.files_created == []
+
+
+def test_conservative_splits_reuse_with_differing_birthtime(p: Any) -> None:
+    # Differing birth times prove the inode was recycled for a new entry.
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False, 500.0)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 10, 1000, False, 900.0)})
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == []
+    assert diff.files_deleted == [p("old")]
+    assert diff.files_created == [p("new")]
+
+
+@pytest.mark.parametrize(
+    ("old_names", "new_names"),
+    [
+        (["a", "b"], ["c"]),
+        (["a"], ["b", "c"]),
+        (["a", "b"], ["c", "d"]),
+    ],
+)
+def test_conservative_refuses_hard_link_pairing(p: Any, old_names: list[str], new_names: list[str]) -> None:
+    # Pair 3/3: one inode reached through several paths (hard links, or a
+    # followed symlink) makes any single-path pairing arbitrary. The
+    # conservative diff must not pick one old path and call it a move: every
+    # vanished path is a deletion and every new path a creation.
+    ref_entries = {name: (42, 10, 1000, False) for name in old_names}
+    snapshot_entries = {name: (42, 10, 1000, False) for name in new_names}
+    ref = _fake_snapshot(p(""), ref_entries)
+    snapshot = _fake_snapshot(p(""), snapshot_entries)
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == []
+    assert sorted(diff.files_deleted) == [p(name) for name in old_names]
+    assert sorted(diff.files_created) == [p(name) for name in new_names]
+
+
+@pytest.mark.parametrize(("source", "destination"), [("a", "c"), ("c", "a")])
+def test_conservative_hard_link_rename_on_disk(p, source: str, destination: str) -> None:
+    # End-to-end check with a real hard link: renaming one name while the
+    # sibling stays is ambiguous, so the conservative emitter-level input is a
+    # deletion plus a creation rather than an arbitrary move.
+    touch(p(source))
+    try:
+        os.link(p(source), p("b"))
+    except OSError as e:
+        pytest.skip(f"Hard links are unavailable: {e}")
+
+    def listdir(path):
+        with os.scandir(path) as entries:
+            yield from sorted(entries, key=lambda entry: entry.name)
+
+    ref = DirectorySnapshot(p(""), listdir=listdir)
+    mv(p(source), p(destination))
+    snapshot = DirectorySnapshot(p(""), listdir=listdir)
+    diff = DirectorySnapshotDiff(ref, snapshot, conservative=True)
+
+    assert diff.files_moved == []
+    assert diff.files_deleted == [p(source)]
+    assert diff.files_created == [p(destination)]
+
+
+@pytest.mark.parametrize("ignore_device", [False, True])
+def test_conservative_works_with_ignore_device(p: Any, ignore_device: bool) -> None:
+    ref = _fake_snapshot(p(""), {"a": (42, 10, 1000, False), "b": (42, 10, 1000, False)})
+    snapshot = _fake_snapshot(p(""), {"c": (42, 10, 1000, False)})
+    diff = DirectorySnapshotDiff(ref, snapshot, ignore_device=ignore_device, conservative=True)
+
+    assert diff.files_moved == []
+    assert sorted(diff.files_deleted) == [p("a"), p("b")]
+    assert diff.files_created == [p("c")]
+
+
+def test_conservative_with_context_manager(p: Any) -> None:
+    ref = _fake_snapshot(p(""), {"old": (42, 10, 1000, False)})
+    snapshot = _fake_snapshot(p(""), {"new": (42, 20, 1000, False)})
+    manager = DirectorySnapshotDiff.ContextManager(p(""), conservative=True)
+    with patch.object(manager, "get_snapshot", side_effect=[ref, snapshot]), manager:
+        pass
+
+    assert manager.diff.files_moved == []
+    assert manager.diff.files_deleted == [p("old")]
+    assert manager.diff.files_created == [p("new")]
+
+
+def test_snapshot_indexes_every_path_of_an_inode(p) -> None:
+    touch(p("a"))
+    try:
+        os.link(p("a"), p("b"))
+    except OSError as e:
+        pytest.skip(f"Hard links are unavailable: {e}")
+
+    snapshot = DirectorySnapshot(p(""))
+    inode = snapshot.inode(p("a"))
+    assert snapshot.paths_for_inode(inode) == {p("a"), p("b")}
+    assert snapshot.path(inode) in {p("a"), p("b")}

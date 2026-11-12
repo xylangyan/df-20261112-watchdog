@@ -66,6 +66,7 @@ class PollingEmitter(EventEmitter):
         event_filter: list[type[FileSystemEvent]] | None = None,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        conservative: bool = False,
     ) -> None:
         super().__init__(event_queue, watch, timeout=timeout, event_filter=event_filter)
         self._snapshot: DirectorySnapshot = EmptyDirectorySnapshot()
@@ -77,6 +78,7 @@ class PollingEmitter(EventEmitter):
             stat=stat,
             listdir=listdir,
         )
+        self._conservative = conservative
 
     def on_thread_start(self) -> None:
         """Take the first snapshot of the watched directory.
@@ -135,7 +137,7 @@ class PollingEmitter(EventEmitter):
                 self._snapshot_failing = False
                 logger.info("Snapshot of %r succeeded again, resuming", self.watch.path)
 
-            events = DirectorySnapshotDiff(self._snapshot, new_snapshot)
+            events = DirectorySnapshotDiff(self._snapshot, new_snapshot, conservative=self._conservative)
             self._snapshot = new_snapshot
 
             # Files.
@@ -176,8 +178,14 @@ class PollingObserver(BaseObserver):
     outage that the OS reports as ``ENOENT`` still looks like a deletion.
     """
 
-    def __init__(self, *, timeout: Seconds = DEFAULT_OBSERVER_TIMEOUT) -> None:
-        super().__init__(PollingEmitter, timeout=timeout)
+    def __init__(self, *, timeout: Seconds = DEFAULT_OBSERVER_TIMEOUT, conservative: bool = False) -> None:
+        """:param timeout: interval between polling the file system.
+        :type timeout: Seconds
+        :type conservative: bool
+        :param conservative: enable conservative move detection. See
+            :class:`watchdog.utils.dirsnapshot.DirectorySnapshotDiff`.
+        """
+        super().__init__(PollingEmitter, timeout=timeout, conservative=conservative)
 
 
 class PollingObserverVFS(BaseObserver):
@@ -189,11 +197,15 @@ class PollingObserverVFS(BaseObserver):
         listdir: Callable[[str | None], Iterator[os.DirEntry]],
         *,
         polling_interval: Seconds = 1,
+        conservative: bool = False,
     ) -> None:
         """:param stat: stat function. See ``os.stat`` for details.
         :param listdir: listdir function. See ``os.scandir`` for details.
         :type polling_interval: Seconds
         :param polling_interval: interval between polling the file system.
+        :type conservative: bool
+        :param conservative: enable conservative move detection. See
+            :class:`watchdog.utils.dirsnapshot.DirectorySnapshotDiff`.
         """
-        emitter_cls = partial(PollingEmitter, stat=stat, listdir=listdir)
+        emitter_cls = partial(PollingEmitter, stat=stat, listdir=listdir, conservative=conservative)
         super().__init__(emitter_cls, timeout=polling_interval)  # type: ignore[arg-type]
