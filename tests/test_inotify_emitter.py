@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import errno
 import os
+import time
 from queue import Queue
-from threading import Event
+from threading import Event, Lock
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -14,7 +16,11 @@ if not platform.is_linux():
 
 from watchdog.events import DirCreatedEvent, FileCreatedEvent, FileDeletedEvent, FileMovedEvent, FileSystemEventHandler
 from watchdog.observers.inotify import InotifyObserver, InotifyWatchGroup
-from watchdog.observers.inotify_c import InotifyFD
+from watchdog.observers.inotify_c import InotifyConstants, InotifyEvent, InotifyFD, Mask
+from watchdog.observers.inotify_move_event_grouper import InotifyMoveEventGrouper
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_observer_does_not_initialize_shared_inotify_fd(monkeypatch):
@@ -293,3 +299,193 @@ def test_filtered_events_in_subdirectory(tmp_path, recursive, create_after_start
         observer.stop()
         observer.join(timeout=5)
         assert not observer.is_alive()
+
+
+class _InjectedEvents:
+    """Collects dispatched events and renders them as an acceptance table."""
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, str, str, str]] = []
+        self._lock = Lock()
+
+    def handler(self, subscription: str) -> FileSystemEventHandler:
+        collector = self
+
+        class Handler(FileSystemEventHandler):
+            def on_any_event(self, event):
+                row = (subscription, event.event_type, os.fsdecode(event.src_path), os.fsdecode(event.dest_path))
+                with collector._lock:
+                    collector.rows.append(row)
+
+        return Handler()
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self.rows)
+
+    def wait(self, expected: int, timeout: float = 5) -> None:
+        deadline = time.monotonic() + timeout
+        while self.count() < expected and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # Unmatched move halves are held for the grouper delay: wait for extras too.
+        time.sleep(InotifyMoveEventGrouper.delay + 0.1)
+
+
+def _events_table(rows: list[tuple[str, str, str, str]], base: Path) -> list[tuple[str, str, str, str]]:
+    """The received rows, with the temporary directory folded into `<base>`."""
+    return [
+        (subscription, kind, src.replace(str(base), "<base>"), dest.replace(str(base), "<base>"))
+        for subscription, kind, src, dest in rows
+    ]
+
+
+def _format_table(rows: list[tuple[str, str, str, str]]) -> str:
+    """Render received events as the acceptance table, submitted sorted."""
+    header = f"{'subscription':<16} {'event':<9} {'path':<32} {'dest_path'}"
+    lines = [header, "-" * len(header)]
+    lines.extend(f"{subscription:<16} {kind:<9} {path:<32} {dest}" for subscription, kind, path, dest in sorted(rows))
+    return "\n".join(line.rstrip() for line in lines)
+
+
+def _watch_group(observer: InotifyObserver, path: Path) -> InotifyWatchGroup:
+    emitters = {emitter.watch.raw_path: emitter for emitter in observer.emitters}
+    return emitters[str(path)]._inotify  # noqa: SLF001
+
+
+def _raw_move(group: InotifyWatchGroup, path: Path, name: str, *, moved_from: bool) -> InotifyEvent:
+    """A raw inotify event for `path/name`, as the kernel reports it."""
+    mask = InotifyConstants.IN_MOVED_FROM if moved_from else InotifyConstants.IN_MOVED_TO
+    wd = group._active_callbacks_by_path[os.fsencode(str(path))]  # noqa: SLF001
+    return InotifyEvent(wd, Mask(mask), 42, os.fsencode(name))
+
+
+@pytest.mark.parametrize("arrival", ["from_then_to", "to_then_from"])
+def test_move_between_two_subscriptions_in_both_arrival_orders(tmp_path, arrival):
+    """A downloader stages files in one directory and atomically moves them to
+    another. The raw inotify halves are injected in both arrival orders; each
+    subscription must report the paths it watches, and the acceptance table
+    must not depend on the order the two halves arrived in.
+    """
+    base = tmp_path / "data"
+    staging = base / "staging"
+    ready = base / "ready"
+    staging.mkdir(parents=True)
+    ready.mkdir()
+
+    events = _InjectedEvents()
+    observer = InotifyObserver()
+    observer.schedule(events.handler("staging"), staging)
+    observer.schedule(events.handler("ready"), ready)
+    observer.schedule(events.handler("parent"), base, recursive=True)
+    try:
+        observer.start()
+
+        moved_from = _raw_move(_watch_group(observer, staging), staging, "recording.mp4", moved_from=True)
+        moved_to = _raw_move(_watch_group(observer, ready), ready, "recording.mp4", moved_from=False)
+        inotify_fd = observer._inotify_fd  # noqa: SLF001
+        for event in [moved_from, moved_to] if arrival == "from_then_to" else [moved_to, moved_from]:
+            inotify_fd.handle_event(event)
+
+        events.wait(7)
+
+        found = _events_table(events.rows, base)
+        assert _format_table(found) == (
+            "subscription     event     path                             dest_path\n"
+            "---------------------------------------------------------------------\n"
+            "parent           modified  <base>/ready\n"
+            "parent           modified  <base>/staging\n"
+            "parent           moved     <base>/staging/recording.mp4     <base>/ready/recording.mp4\n"
+            "ready            created   <base>/ready/recording.mp4\n"
+            "ready            modified  <base>/ready\n"
+            "staging          deleted   <base>/staging/recording.mp4\n"
+            "staging          modified  <base>/staging"
+        )
+    finally:
+        observer.stop()
+        if observer.is_alive():
+            observer.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("subscription", "directory", "expected"),
+    [
+        (
+            "source only",
+            "staging",
+            (
+                "subscription     event     path                             dest_path\n"
+                "---------------------------------------------------------------------\n"
+                "source only      deleted   <base>/staging/recording.mp4\n"
+                "source only      modified  <base>/staging"
+            ),
+        ),
+        (
+            "destination only",
+            "ready",
+            (
+                "subscription     event     path                             dest_path\n"
+                "---------------------------------------------------------------------\n"
+                "destination only created   <base>/ready/recording.mp4\n"
+                "destination only modified  <base>/ready"
+            ),
+        ),
+    ],
+)
+def test_move_with_only_one_side_subscribed(tmp_path, subscription, directory, expected):
+    """Subscribing to only one of the two directories keeps the semantics of
+    that side: the move crossed its boundary, so it is a delete or a create."""
+    base = tmp_path / "data"
+    (base / "staging").mkdir(parents=True)
+    (base / "ready").mkdir()
+    side = base / directory
+
+    events = _InjectedEvents()
+    observer = InotifyObserver()
+    observer.schedule(events.handler(subscription), side)
+    try:
+        observer.start()
+
+        group = _watch_group(observer, side)
+        inotify_fd = observer._inotify_fd  # noqa: SLF001
+        # Only the half that this subscription's watch receives reaches it.
+        inotify_fd.handle_event(_raw_move(group, side, "recording.mp4", moved_from=directory == "staging"))
+
+        events.wait(2)
+        assert _format_table(_events_table(events.rows, base)) == expected
+    finally:
+        observer.stop()
+        if observer.is_alive():
+            observer.join(timeout=5)
+
+
+@pytest.mark.parametrize("arrival", ["from_then_to", "to_then_from"])
+def test_rename_within_one_subscription(tmp_path, arrival):
+    """A rename inside a watched directory is still one move event."""
+    directory = tmp_path / "staging"
+    directory.mkdir()
+
+    events = _InjectedEvents()
+    observer = InotifyObserver()
+    observer.schedule(events.handler("staging"), directory)
+    try:
+        observer.start()
+
+        group = _watch_group(observer, directory)
+        inotify_fd = observer._inotify_fd  # noqa: SLF001
+        moved_from = _raw_move(group, directory, "a.tmp", moved_from=True)
+        moved_to = _raw_move(group, directory, "a", moved_from=False)
+        for event in [moved_from, moved_to] if arrival == "from_then_to" else [moved_to, moved_from]:
+            inotify_fd.handle_event(event)
+
+        events.wait(2)
+
+        assert _format_table(_events_table(events.rows, tmp_path)) == (
+            "subscription     event     path                             dest_path\n"
+            "---------------------------------------------------------------------\n"
+            "staging          modified  <base>/staging\n"
+            "staging          moved     <base>/staging/a.tmp             <base>/staging/a"
+        )
+    finally:
+        observer.stop()
+        if observer.is_alive():
+            observer.join(timeout=5)

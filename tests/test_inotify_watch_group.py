@@ -192,6 +192,60 @@ def assert_event(inotify: InotifyWatchGroup, expected_path: str, expected_kind: 
     assert event.ev.mask & expected_kind
 
 
+@pytest.mark.parametrize("arrival", ["from_then_to", "to_then_from"])
+def test_unpaired_half_is_delayed_until_its_partner_arrives(p, arrival):
+    """A lone IN_MOVED_TO used to be emitted before the IN_MOVED_FROM of the
+    same move could arrive, which split a single move into a created and a
+    deleted event."""
+    mkdir(p("dir1"))
+    mkdir(p("dir2"))
+    touch(p("dir1", "a"))
+
+    inotify = create_inotify_watch(p("").encode(), recursive=True)
+    wd_dir1 = inotify._active_callbacks_by_path[p("dir1").encode()]  # noqa: SLF001
+    wd_dir2 = inotify._active_callbacks_by_path[p("dir2").encode()]  # noqa: SLF001
+    move_from = InotifyEvent(wd_dir1, Mask(InotifyConstants.IN_MOVED_FROM), 7, b"a")
+    move_to = InotifyEvent(wd_dir2, Mask(InotifyConstants.IN_MOVED_TO), 7, b"b")
+    if arrival == "from_then_to":
+        inotify.on_event(move_from)
+        inotify.on_event(move_to)
+    else:
+        inotify.on_event(move_to)
+        inotify.on_event(move_from)
+
+    frm, to = wait_for_move_event(inotify.read_event)
+    assert frm.path == p("dir1", "a").encode()
+    assert to.path == p("dir2", "b").encode()
+    inotify.deactivate()
+
+
+@pytest.mark.parametrize("arrival", ["from_then_to", "to_then_from"])
+def test_paired_move_of_directory_reconciles_watches(p, arrival):
+    """The watches below a moved directory are relocated once both halves are
+    known, whichever half the callback saw first."""
+    mkdir(p("dir1", "moved", "nested"), parents=True)
+    mkdir(p("dir2"))
+
+    inotify = create_inotify_watch(p("").encode(), recursive=True)
+    wd_dir1 = inotify._active_callbacks_by_path[p("dir1").encode()]  # noqa: SLF001
+    wd_dir2 = inotify._active_callbacks_by_path[p("dir2").encode()]  # noqa: SLF001
+    move_from = InotifyEvent(wd_dir1, Mask(InotifyConstants.IN_MOVED_FROM | InotifyConstants.IN_ISDIR), 9, b"moved")
+    move_to = InotifyEvent(wd_dir2, Mask(InotifyConstants.IN_MOVED_TO | InotifyConstants.IN_ISDIR), 9, b"moved")
+    if arrival == "from_then_to":
+        inotify.on_event(move_from)
+        inotify.on_event(move_to)
+    else:
+        inotify.on_event(move_to)
+        inotify.on_event(move_from)
+
+    frm, to = wait_for_move_event(inotify.read_event)
+    assert frm.path == p("dir1", "moved").encode()
+    assert to.path == p("dir2", "moved").encode()
+    assert p("dir2", "moved", "nested").encode() in inotify._active_callbacks_by_path  # noqa: SLF001
+    assert p("dir1", "moved", "nested").encode() not in inotify._active_callbacks_by_path  # noqa: SLF001
+    inotify.deactivate()
+
+
 def assert_touch_events(inotify: InotifyWatchGroup, expected_path: str):
     assert_event(inotify, expected_path, InotifyConstants.IN_OPEN)
     assert_event(inotify, expected_path, InotifyConstants.IN_ATTRIB)

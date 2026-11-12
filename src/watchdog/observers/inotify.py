@@ -155,8 +155,10 @@ class InotifyWatchGroup(WatchCallback):
     """The event mask for this inotify instance."""
     follow_symlink: bool = False
 
-    _move_event_grouper: InotifyMoveEventGrouper = field(default_factory=InotifyMoveEventGrouper, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _move_event_grouper: InotifyMoveEventGrouper = field(init=False)
+    # RLock: on_event() calls into the move grouper, whose pairing callback
+    # (on_move_paired()) reconciles the same watches re-entrantly.
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     _id: CallbackId = field(init=False)
 
     _is_active: bool = field(default=False, init=False)
@@ -167,6 +169,9 @@ class InotifyWatchGroup(WatchCallback):
     def __post_init__(self) -> None:
         self.event_mask = InotifyWatchGroup.build_event_mask(self.event_mask, follow_symlink=self.follow_symlink)
         self._id = CallbackId(id(self))
+        # The watch bookkeeping of a move depends on both of its halves, so it
+        # must run as soon as the halves are paired, before the pair is read.
+        self._move_event_grouper = InotifyMoveEventGrouper(self.on_move_paired, self.on_move_unpaired)
         self._activate()
 
     @staticmethod
@@ -181,17 +186,6 @@ class InotifyWatchGroup(WatchCallback):
     def is_active(self) -> bool:
         """Returns True if there are any callbacks active"""
         return self._is_active
-
-    def _source_for_move(self, cookie: int) -> bytes | None:
-        """The source path corresponding to the given MOVED_TO event.
-
-        If the source path is outside the monitored directories, None
-        is returned instead.
-        """
-        src_event = self._move_event_grouper.get_queued_moved_from_event(cookie)
-        if src_event is not None:
-            return src_event.path
-        return None
 
     @property
     def _callback(self) -> WatchCallback:
@@ -236,43 +230,62 @@ class InotifyWatchGroup(WatchCallback):
             if src_path is None:
                 return
 
-            # todo look into desired behavior for IN_MOVE_SELF events
-            #  (keep watching?, stop watching?, are they even possible?)
-            if event.is_moved_from:
-                # TODO: When a directory from a watched directory
-                #  is moved into another part of the filesystem, this
-                #  will not generate DELETE events for the directory tree.
-                #  We need to coalesce IN_MOVED_FROM events and those
-                #  IN_MOVED_FROM events which don't pair up with
-                #  IN_MOVED_TO events should be marked IN_DELETE (maybe?)
-                #  instead relative to this directory. And the respective
-                #  callbacks for the directory and sub directory must be removed.
-                #
-                #  also: hold back all other events for this directory and its
-                #  subdirectories, until we know whether it is still watched
-                pass
-            elif event.is_moved_to:
-                move_src_path = self._source_for_move(event.cookie)
-                move_dst_path = src_path
-                source_was_watched = move_src_path is not None and self._move_watches(move_src_path, move_dst_path)
-                if event.is_directory and self.is_recursive and not source_was_watched:
-                    # The source may have been seen before its watch was registered.
-                    self._add_all_callbacks(src_path)
-                    if move_src_path is not None:
-                        for sub_event in self._recursive_simulate(src_path):
-                            sub_src_path = self._build_event_source_path(sub_event)
-                            if sub_src_path is not None:
-                                self._move_event_grouper.put_event(PathedInotifyEvent(sub_event, sub_src_path))
-            elif event.is_create and event.is_directory and self.is_recursive:
-                self._add_all_callbacks(src_path)
-
+            # Both halves of a move are placed as they arrive: the path of
+            # each half belongs to the watch it arrived on. Which of the two
+            # paths this group owns is only known once they are paired, so the
+            # bookkeeping that depends on it happens in on_move_paired() /
+            # on_move_unpaired().
             self._move_event_grouper.put_event(PathedInotifyEvent(event, src_path))
 
             if event.is_create and event.is_directory and self.is_recursive:
+                self._add_all_callbacks(src_path)
                 for sub_event in self._recursive_simulate(src_path):
                     sub_src_path = self._build_event_source_path(sub_event)
                     if sub_src_path is not None:
                         self._move_event_grouper.put_event(PathedInotifyEvent(sub_event, sub_src_path))
+
+    def on_move_paired(self, pair: tuple[PathedInotifyEvent, PathedInotifyEvent]) -> None:
+        """Reconcile this group's watches with a move as soon as both of its
+        halves have been paired, whichever half arrived first."""
+        from_event, to_event = pair
+        with self._lock:
+            if self.is_active:
+                self.on_watched_move(from_event, to_event)
+
+    def on_move_unpaired(self, event: PathedInotifyEvent) -> None:
+        """Reconcile this group's watches with a move whose other half never
+        arrived: the object crossed this subscription's boundary."""
+        with self._lock:
+            if self.is_active and event.ev.is_moved_to:
+                self.on_unwatched_move(event)
+
+    def on_watched_move(self, from_event: PathedInotifyEvent, to_event: PathedInotifyEvent) -> None:
+        """Move the watches below the source of a paired move to its
+        destination, and reconcile what this group did not watch before.
+
+        Called for the subscription the moved object belongs to: the watch
+        that reported IN_MOVED_FROM.
+        """
+        with self._lock:
+            if not self.is_active:
+                return
+            source_was_watched = self._move_watches(from_event.path, to_event.path)
+            if to_event.ev.is_directory and self.is_recursive and not source_was_watched:
+                # The source may have been seen before its watch was registered.
+                self._add_all_callbacks(to_event.path)
+                for sub_event in self._recursive_simulate(to_event.path):
+                    sub_src_path = self._build_event_source_path(sub_event)
+                    if sub_src_path is not None:
+                        self._move_event_grouper.put_event(PathedInotifyEvent(sub_event, sub_src_path))
+
+    def on_unwatched_move(self, to_event: PathedInotifyEvent) -> None:
+        """Start watching a directory that was moved into this recursive
+        watch from outside of it."""
+        with self._lock:
+            if not self.is_active:
+                return
+            if to_event.ev.is_directory and self.is_recursive:
+                self._add_all_callbacks(to_event.path)
 
     def _recursive_simulate(self, src_path: bytes) -> list[InotifyEvent]:
         # HACK: We need to traverse the directory path recursively and simulate
