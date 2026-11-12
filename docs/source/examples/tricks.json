@@ -1,0 +1,22 @@
+{
+  "tricks": [
+    {
+      "watchdog.tricks.LoggerTrick": {
+        "patterns": ["**/*.py", "**/*.js"]
+      }
+    },
+    {
+      "watchdog.tricks.ShellCommandTrick": {
+        "patterns": ["**/*.py"],
+        "shell_command": "echo 'file changed: ${watch_src_path}'",
+        "wait_for_process": true
+      }
+    },
+    {
+      "watchdog.tricks.AutoRestartTrick": {
+        "command": ["python", "-m", "http.server"],
+        "patterns": ["**/*.html", "**/*.css", "**/*.js"]
+      }
+    }
+  ]
+}
