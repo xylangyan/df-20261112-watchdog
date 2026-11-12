@@ -368,6 +368,24 @@ class IgnorePolicy(StrEnum):
     """Drops the event only if all paths match the ignore rules (permissive mode)."""
 
 
+class QueuedEventPolicy(StrEnum):
+    """Policy selecting which matching rules apply to events already queued
+    when a handler's filters are updated at runtime.
+
+    Events produced after the update always use the new rules. This policy only
+    affects events that were queued by an emitter before the update but have not
+    been dispatched yet.
+    """
+
+    OLD_RULES = "old_rules"
+    """Events already queued keep being evaluated against the rules in place
+    when they were produced; only later events use the new rules (default)."""
+
+    NEW_RULES = "new_rules"
+    """Every event, including ones already queued, is evaluated against the
+    new rules at dispatch time."""
+
+
 class PathMatchingEventHandler(FileSystemEventHandler):
     """Base class for event handlers matching paths against patterns or regexes.
 
@@ -394,6 +412,7 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         self._ignore_directories = ignore_directories
         self._case_sensitive = case_sensitive
         self._ignore_policy = IgnorePolicy(ignore_policy)
+        self._queued_event_policy = QueuedEventPolicy.OLD_RULES
 
     @property
     def ignore_directories(self) -> bool:
@@ -412,6 +431,11 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         """Return the ignore policy."""
         return self._ignore_policy
 
+    @property
+    def queued_event_policy(self) -> QueuedEventPolicy:
+        """Policy applied to events already queued when the rules are updated."""
+        return self._queued_event_policy
+
     def is_ignored(self, path: str, *, base_path: str | None = None) -> bool:
         """Return True if path matches ignore criteria."""
         raise NotImplementedError
@@ -422,6 +446,41 @@ class PathMatchingEventHandler(FileSystemEventHandler):
 
     def _validate_rules(self) -> None:
         """Hook to validate matching and ignore rules."""
+
+    def _matcher(self, event: FileSystemEvent) -> PathMatchingEventHandler:
+        """Return the rule set used to evaluate ``event``.
+
+        Events queued before a rule update carry a snapshot of the rule set
+        active when they were produced; see :class:`QueuedEventPolicy`. Under
+        :attr:`~watchdog.events.QueuedEventPolicy.NEW_RULES` the snapshot is
+        ignored and the current rules always win.
+        """
+        if self.queued_event_policy == QueuedEventPolicy.OLD_RULES:
+            snapshots = getattr(event, "rule_snapshots", None)
+            if snapshots is not None:
+                previous_matcher = snapshots.get(self)
+                if previous_matcher is not None:
+                    return previous_matcher
+        return self
+
+    def rule_snapshot(self) -> PathMatchingEventHandler:
+        """Capture an immutable copy of the current matching rules.
+
+        Stored on an event when it is queued so that
+        :attr:`~watchdog.events.QueuedEventPolicy.OLD_RULES` can evaluate
+        already-queued events against the rules in force when they occurred.
+        The returned handler is never registered with an observer and only
+        answers matching queries.
+        """
+        raise NotImplementedError
+
+    def attach_rule_snapshot(self, event: FileSystemEvent) -> None:
+        """Attach this handler's current rule snapshot to a queued event."""
+        snapshots = getattr(event, "rule_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            event.rule_snapshots = snapshots  # type: ignore[attr-defined]
+        snapshots.setdefault(self, self.rule_snapshot())
 
     def dispatch(self, event: FileSystemEvent) -> None:
         """Dispatches events to the appropriate methods.
@@ -434,6 +493,7 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         if self.ignore_directories and event.is_directory:
             return
 
+        matcher = self._matcher(event)
         base_path = getattr(event, "watch_path", None)
 
         paths = []
@@ -442,14 +502,28 @@ class PathMatchingEventHandler(FileSystemEventHandler):
         if event.src_path:
             paths.append(os.fsdecode(event.src_path))
 
-        if self.ignore_policy == IgnorePolicy.ANY:
-            if any(self.is_ignored(p, base_path=base_path) for p in paths):
+        if matcher.ignore_policy == IgnorePolicy.ANY:
+            if any(matcher.is_ignored(p, base_path=base_path) for p in paths):
                 return
-        elif all(self.is_ignored(p, base_path=base_path) for p in paths):
+        elif all(matcher.is_ignored(p, base_path=base_path) for p in paths):
             return
 
-        if any(self.is_included(p, base_path=base_path) for p in paths):
+        if any(matcher.is_included(p, base_path=base_path) for p in paths):
             super().dispatch(event)
+
+
+def attach_rule_snapshots(event: FileSystemEvent, handlers: set[FileSystemEventHandler]) -> None:
+    """Attach a rule snapshot to ``event`` for every path-matching handler.
+
+    Called when an event is queued, so that
+    :attr:`~watchdog.events.QueuedEventPolicy.OLD_RULES` evaluates it against
+    the rules in force at production time even if the handlers are updated
+    before the event gets dispatched. Handlers that are not path-matching are
+    skipped.
+    """
+    for handler in handlers:
+        if isinstance(handler, PathMatchingEventHandler):
+            handler.attach_rule_snapshot(event)
 
 
 class PatternMatchingEventHandler(PathMatchingEventHandler):
@@ -528,6 +602,15 @@ class PatternMatchingEventHandler(PathMatchingEventHandler):
             )
         )
 
+    def rule_snapshot(self) -> PatternMatchingEventHandler:
+        return PatternMatchingEventHandler(
+            patterns=list(self.patterns) if self.patterns is not None else None,
+            ignore_patterns=list(self.ignore_patterns) if self.ignore_patterns is not None else None,
+            ignore_directories=self.ignore_directories,
+            case_sensitive=self.case_sensitive,
+            ignore_policy=self.ignore_policy,
+        )
+
     def _validate_rules(self) -> None:
         if self.ignore_patterns:
             included = set(["**"] if self.patterns is None else self.patterns)
@@ -539,6 +622,44 @@ class PatternMatchingEventHandler(PathMatchingEventHandler):
             if common_patterns:
                 error = f"conflicting patterns `{common_patterns}` included and excluded"
                 raise ValueError(error)
+
+    def update_patterns(
+        self,
+        *,
+        patterns: list[str] | None = None,
+        ignore_patterns: list[str] | None = None,
+        queued_events: QueuedEventPolicy | Literal["old_rules", "new_rules"] = QueuedEventPolicy.OLD_RULES,
+    ) -> None:
+        """Update the matching rules at runtime without re-scheduling the watch.
+
+        The update is atomic: if the new rules are invalid (for instance a
+        pattern listed in both ``patterns`` and ``ignore_patterns``), a
+        :class:`ValueError` is raised and the previous rules keep working
+        unchanged. Moved events keep the existing matching semantics: the new
+        rules apply to both the source and destination paths, honoring
+        :attr:`ignore_policy`.
+
+        :param patterns:
+            New patterns to allow matching event paths, replacing the current ones.
+        :param ignore_patterns:
+            New patterns to ignore matching event paths, replacing the current ones.
+        :param queued_events:
+            Whether events already queued but not yet dispatched are matched
+            against the old or the new rules. Defaults to
+            :attr:`~watchdog.events.QueuedEventPolicy.OLD_RULES`.
+        :type queued_events:
+            :class:`~watchdog.events.QueuedEventPolicy` | str
+        """
+        policy = QueuedEventPolicy(queued_events)
+        old_patterns, old_ignore_patterns = self._patterns, self._ignore_patterns
+        self._patterns = patterns
+        self._ignore_patterns = ignore_patterns
+        try:
+            self._validate_rules()
+        except Exception:
+            self._patterns, self._ignore_patterns = old_patterns, old_ignore_patterns
+            raise
+        self._queued_event_policy = policy
 
 
 class RegexMatchingEventHandler(PathMatchingEventHandler):
@@ -603,6 +724,15 @@ class RegexMatchingEventHandler(PathMatchingEventHandler):
     def is_included(self, path: str, *, base_path: str | None = None) -> bool:
         return any(r.match(path) for r in self.regexes)
 
+    def rule_snapshot(self) -> RegexMatchingEventHandler:
+        return RegexMatchingEventHandler(
+            regexes=[r.pattern for r in self.regexes],
+            ignore_regexes=[r.pattern for r in self.ignore_regexes],
+            ignore_directories=self.ignore_directories,
+            case_sensitive=self.case_sensitive,
+            ignore_policy=self.ignore_policy,
+        )
+
     def _validate_rules(self) -> None:
         if self._ignore_regexes:
             included = {r.pattern if self.case_sensitive else r.pattern.lower() for r in self._regexes}
@@ -611,6 +741,52 @@ class RegexMatchingEventHandler(PathMatchingEventHandler):
             if common_regexes:
                 error = f"conflicting regexes `{common_regexes}` included and excluded"
                 raise ValueError(error)
+
+    def update_regexes(
+        self,
+        *,
+        regexes: list[str] | None = None,
+        ignore_regexes: list[str] | None = None,
+        queued_events: QueuedEventPolicy | Literal["old_rules", "new_rules"] = QueuedEventPolicy.OLD_RULES,
+    ) -> None:
+        """Update the matching rules at runtime without re-scheduling the watch.
+
+        The update is atomic: if the new rules are invalid (for instance an
+        invalid regex or a regex listed in both ``regexes`` and
+        ``ignore_regexes``), an exception is raised and the previous rules
+        keep working unchanged. Moved events keep the existing matching
+        semantics: the new rules apply to both the source and destination
+        paths, honoring :attr:`ignore_policy`.
+
+        :param regexes:
+            New regexes to allow matching event paths, replacing the current ones.
+        :param ignore_regexes:
+            New regexes to ignore matching event paths, replacing the current ones.
+        :param queued_events:
+            Whether events already queued but not yet dispatched are matched
+            against the old or the new rules. Defaults to
+            :attr:`~watchdog.events.QueuedEventPolicy.OLD_RULES`.
+        :type queued_events:
+            :class:`~watchdog.events.QueuedEventPolicy` | str
+        """
+        if regexes is None:
+            regexes = [r".*"]
+        elif isinstance(regexes, str):
+            regexes = [regexes]
+        if ignore_regexes is None:
+            ignore_regexes = []
+        policy = QueuedEventPolicy(queued_events)
+        flags = 0 if self.case_sensitive else re.IGNORECASE
+        new_regexes = [re.compile(r, flags) for r in regexes]
+        new_ignore_regexes = [re.compile(r, flags) for r in ignore_regexes]
+        old_regexes, old_ignore_regexes = self._regexes, self._ignore_regexes
+        self._regexes, self._ignore_regexes = new_regexes, new_ignore_regexes
+        try:
+            self._validate_rules()
+        except Exception:
+            self._regexes, self._ignore_regexes = old_regexes, old_ignore_regexes
+            raise
+        self._queued_event_policy = policy
 
 
 class LoggingEventHandler(FileSystemEventHandler):

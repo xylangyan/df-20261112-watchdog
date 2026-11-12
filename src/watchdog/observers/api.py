@@ -8,15 +8,16 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from watchdog.events import FileSystemMovedEvent
+from watchdog.events import FileSystemMovedEvent, PathMatchingEventHandler, attach_rule_snapshots
 from watchdog.utils import BaseThread
 from watchdog.utils.bricks import SkipRepeatsQueue
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Callable
     from typing import Any, Self
 
-    from watchdog.events import FileSystemEvent, FileSystemEventHandler
+    from watchdog.events import FileSystemEvent, FileSystemEventHandler, QueuedEventPolicy
     from watchdog.utils import Seconds
 
 DEFAULT_EMITTER_TIMEOUT: Seconds = 1.0
@@ -150,6 +151,9 @@ class EventEmitter(BaseThread):
         self._watch = watch
         self._timeout = timeout
         self._event_filter = frozenset(event_filter) if event_filter is not None else None
+        # Injected by BaseObserver after construction; returns the handlers of
+        # this emitter's watch so rule snapshots can be frozen at queue time.
+        self._handlers_provider: Callable[[ObservedWatch], set[FileSystemEventHandler]] | None = None
 
     @property
     def timeout(self) -> Seconds:
@@ -171,6 +175,11 @@ class EventEmitter(BaseThread):
             or a subclass.
         """
         if self._event_filter is None or any(isinstance(event, cls) for cls in self._event_filter):
+            # Freeze the current matching rules on the event before it is
+            # queued, so runtime filter updates can keep applying old rules
+            # to already-queued events (QueuedEventPolicy.OLD_RULES).
+            if self._handlers_provider is not None:
+                attach_rule_snapshots(event, self._handlers_provider(self._watch))
             self._event_queue.put((event, self.watch))
 
     def queue_events(self, timeout: Seconds) -> None:
@@ -308,6 +317,12 @@ class BaseObserver(EventDispatcher):
     def _remove_handlers_for_watch(self, watch: ObservedWatch) -> None:
         del self._handlers[watch]
 
+    def _handlers_for_watch(self, watch: ObservedWatch) -> set[FileSystemEventHandler]:
+        # Snapshot the handler set: emitters call this from their own thread
+        # while queueing events, and set membership must remain stable while
+        # rule snapshots are attached. .get() avoids resurrecting removed watches.
+        return set(self._handlers.get(watch, ()))
+
     @property
     def emitters(self) -> set[EventEmitter]:
         """Returns event emitter created by this observer."""
@@ -400,6 +415,7 @@ class BaseObserver(EventDispatcher):
                     event_filter=event_filter,
                     **self._emitter_kwargs,
                 )
+                emitter._handlers_provider = self._handlers_for_watch  # noqa: SLF001
                 if self.is_alive():
                     emitter.start()
                 self._add_emitter(emitter)
@@ -460,6 +476,61 @@ class BaseObserver(EventDispatcher):
             del self._handlers[watch]
             self._remove_emitter(emitter)
             self._watches.remove(watch)
+
+    def update_handler_filter(
+        self,
+        event_handler: PathMatchingEventHandler,
+        watch: ObservedWatch,
+        *,
+        queued_events: QueuedEventPolicy | str = "old_rules",
+        **rules: Any,
+    ) -> None:
+        """Update the matching rules of a scheduled handler at runtime.
+
+        Unlike ``unschedule()`` followed by ``schedule()``, this keeps the
+        subscription and its underlying emitter alive, so no events are lost
+        during the switch and other handlers sharing the same watch are not
+        affected. The update is atomic: if the new rules are invalid, the
+        exception propagates and the previous rules keep working unchanged.
+
+        :param event_handler:
+            The scheduled handler whose rules are updated. It must be a
+            :class:`~watchdog.events.PathMatchingEventHandler` subclass
+            (e.g. :class:`~watchdog.events.PatternMatchingEventHandler` or
+            :class:`~watchdog.events.RegexMatchingEventHandler`) currently
+            registered for ``watch``.
+        :param watch:
+            The watch the handler is scheduled for.
+        :type watch:
+            An instance of :class:`ObservedWatch` or a subclass of
+            :class:`ObservedWatch`
+        :param queued_events:
+            Whether events already queued but not yet dispatched are matched
+            against the old or the new rules. Accepts a
+            :class:`~watchdog.events.QueuedEventPolicy` or the strings
+            ``"old_rules"`` (default) and ``"new_rules"``.
+        :param rules:
+            The new matching rules, forwarded to the handler's update method
+            (``patterns``/``ignore_patterns`` or ``regexes``/``ignore_regexes``).
+        :raises KeyError:
+            If the handler is not scheduled for ``watch``.
+        :raises TypeError:
+            If the handler does not support runtime rule updates.
+        :raises ValueError:
+            If the new rules are invalid; the previous rules remain active.
+        """
+        with self._lock:
+            # Use .get() rather than indexing: _handlers is a defaultdict, so
+            # indexing it here would resurrect a watch that unschedule() removed.
+            handlers = self._handlers.get(watch, set())
+            if event_handler not in handlers:
+                error = f"{event_handler!r} is not scheduled for {watch!r}"
+                raise KeyError(error)
+            update = getattr(event_handler, "update_patterns", None) or getattr(event_handler, "update_regexes", None)
+            if update is None:
+                error = f"{type(event_handler).__name__} does not support runtime rule updates"
+                raise TypeError(error)
+            update(queued_events=queued_events, **rules)
 
     def unschedule_all(self) -> None:
         """Unschedules all watches and detaches all associated event handlers."""
