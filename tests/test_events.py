@@ -12,6 +12,9 @@ from watchdog.events import (
     EVENT_TYPE_MODIFIED,
     EVENT_TYPE_MOVED,
     EVENT_TYPE_OPENED,
+    EVENT_TYPE_RECOVERY_BEGIN,
+    EVENT_TYPE_RECOVERY_END,
+    EVENT_TYPE_RESYNC_REQUIRED,
     DirAttribEvent,
     DirCreatedEvent,
     DirDeletedEvent,
@@ -26,6 +29,9 @@ from watchdog.events import (
     FileMovedEvent,
     FileOpenedEvent,
     FileSystemEventHandler,
+    RecoveryBeginEvent,
+    RecoveryEndEvent,
+    ResyncRequiredEvent,
     generate_sub_moved_events,
 )
 
@@ -142,6 +148,24 @@ def test_dir_created_event():
     assert event.event_type == EVENT_TYPE_CREATED
     assert event.is_directory
     assert not event.is_synthetic
+
+
+def test_recovery_marker_events_are_synthetic():
+    for cls, event_type in [
+        (RecoveryBeginEvent, EVENT_TYPE_RECOVERY_BEGIN),
+        (RecoveryEndEvent, EVENT_TYPE_RECOVERY_END),
+        (ResyncRequiredEvent, EVENT_TYPE_RESYNC_REQUIRED),
+    ]:
+        event = cls(path_1)
+        assert event.src_path == path_1
+        assert event.event_type == event_type
+        assert event.is_synthetic
+
+
+def test_recovery_markers_dispatch_through_base_handler():
+    handler = FileSystemEventHandler()
+    for cls in (RecoveryBeginEvent, RecoveryEndEvent, ResyncRequiredEvent):
+        handler.dispatch(cls(path_1))
 
 
 def test_file_system_event_handler_dispatch():

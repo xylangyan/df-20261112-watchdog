@@ -10,6 +10,8 @@ Changelog
 
 **Other Changes**
 
+- [recovery] Add ``watchdog.utils.recovery.SnapshotRecoveryCoordinator`` to compensate for events lost in an overflow by diffing the last known snapshot against a stability-checked rescan. Compensation events are synthetic and bracketed by the new ``RecoveryBeginEvent`` / ``RecoveryEndEvent`` markers; live events arriving during the rescan are buffered and dispatched after the end marker, and an unobtainable consistent snapshot raises a ``ResyncRequiredEvent``. The base handler gets matching no-op hooks so existing observers stay compatible.
+- [dirsnapshot] ``DirectorySnapshot`` accepts ``stable=True`` to verify that the tree does not change while it is being walked, raising ``SnapshotUnstableError`` on a torn scan.
 - [kqueue] Stop the emitter with a ``DirDeletedEvent`` when the watched directory is removed or moved, instead of letting its thread die with ``FileNotFoundError``. The kevents read in the same batch are still reported. (`#1436 <https://github.com/gorakhargosh/watchdog/issues/1436>`__, thanks to @karolyi)
 - [core] Allow pattern matching to evaluate relative paths against the watched root directory, supporting intuitive non-recursive patterns (e.g. ``*.json``, ``logs/*.log``) under ``full_match()``. (`#1430 <https://github.com/gorakhargosh/watchdog/issues/1430>`__ Thanks to @prateek-dagar)
 - [dirsnapshot] Avoid duplicate create or delete events when a renamed file has another hard link in the watched directory. (`#1425 <https://github.com/gorakhargosh/watchdog/issues/1425>`__, thanks to @parijat1222q)

@@ -27,6 +27,10 @@ Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: SnapshotUnstableError
+   :members:
+   :show-inheritance:
+
 """
 
 from __future__ import annotations
@@ -43,6 +47,32 @@ from watchdog.utils.statx import get_statx_birthtime_ns, is_statx_available
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from typing import Any
+
+
+class SnapshotUnstableError(RuntimeError):
+    """Raised when a directory tree changes while it is being scanned.
+
+    Only raised when a snapshot is requested with ``stable=True``; the
+    default single-pass snapshot behavior never raises it.
+    """
+
+
+def _stable_listdir(
+    listdir: Callable[[str | None], Iterator[os.DirEntry]],
+) -> Callable[[str | None], Iterator[os.DirEntry]]:
+    """Wrap ``listdir`` so that a directory that changes while it is being
+    scanned raises :class:`SnapshotUnstableError` instead of silently
+    returning a torn view of the tree."""
+
+    def checking_listdir(path: str | None) -> Iterator[os.DirEntry]:
+        entries = list(listdir(path))
+        # DirEntry objects do not compare equal across scans; compare names.
+        if [entry.name for entry in listdir(path)] != [entry.name for entry in entries]:
+            msg = f"directory changed while scanning: {path!r}"
+            raise SnapshotUnstableError(msg)
+        return iter(entries)
+
+    return checking_listdir
 
 
 class DirectorySnapshotDiff:
@@ -323,6 +353,11 @@ class DirectorySnapshotDiff:
             Set to True only if you are sure you will always use the same device.
         :type ignore_device:
             :class:`bool`
+        :param stable:
+            Forwarded to :class:`DirectorySnapshot`; ``True`` verifies that the
+            tree does not change while it is being walked.
+        :type stable:
+            :class:`bool`
         """
 
         def __init__(
@@ -333,12 +368,14 @@ class DirectorySnapshotDiff:
             stat: Callable[[str], os.stat_result] = os.stat,
             listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
             ignore_device: bool = False,
+            stable: bool = False,
         ) -> None:
             self.path = path
             self.recursive = recursive
             self.stat = stat
             self.listdir = listdir
             self.ignore_device = ignore_device
+            self.stable = stable
 
         def __enter__(self) -> None:
             self.pre_snapshot = self.get_snapshot()
@@ -357,6 +394,7 @@ class DirectorySnapshotDiff:
                 recursive=self.recursive,
                 stat=self.stat,
                 listdir=self.listdir,
+                stable=self.stable,
             )
 
 
@@ -380,6 +418,12 @@ class DirectorySnapshot:
         for every entry in the directory tree.
     :param listdir:
         Use custom listdir function. For details see ``os.scandir``.
+    :param stable:
+        ``True`` to verify that the tree does not change while it is being
+        walked. Each directory is listed twice and compared; a change raises
+        :class:`SnapshotUnstableError` and the partially built snapshot is
+        discarded. Used by overflow recovery to decide whether a rescan
+        produced a consistent view of the tree.
     """
 
     def __init__(
@@ -389,10 +433,13 @@ class DirectorySnapshot:
         recursive: bool = True,
         stat: Callable[[str], os.stat_result] = os.stat,
         listdir: Callable[[str | None], Iterator[os.DirEntry]] = os.scandir,
+        stable: bool = False,
     ) -> None:
         self.recursive = recursive
         self.stat = stat
-        self.listdir = listdir
+        self.listdir = _stable_listdir(listdir) if stable else listdir
+        self.stable = stable
+        """Whether the tree was verified to stay stable while being walked."""
 
         self._stat_info: dict[bytes | str, os.stat_result] = {}
         self._inode_to_path: dict[tuple[int, int], bytes | str] = {}
@@ -402,10 +449,14 @@ class DirectorySnapshot:
         self._stat_info[path] = st
         self._inode_to_path[(st.st_ino, st.st_dev)] = path
 
-        for p, st in self.walk(path):
-            i = (st.st_ino, st.st_dev)
-            self._inode_to_path[i] = p
-            self._stat_info[p] = st
+        try:
+            for p, st in self.walk(path):
+                i = (st.st_ino, st.st_dev)
+                self._inode_to_path[i] = p
+                self._stat_info[p] = st
+        except SnapshotUnstableError:
+            self.stable = False
+            raise
 
     def walk(self, root: str) -> Iterator[tuple[str, os.stat_result]]:
         try:
@@ -532,6 +583,9 @@ class EmptyDirectorySnapshot(DirectorySnapshot):
     DirectorySnapshot and DirectorySnapshotDiff in order to get all the files/folders
     in the directory as created.
     """
+
+    stable = True
+    """An empty snapshot is trivially consistent."""
 
     def __init__(self) -> None:
         self._stat_info: dict[bytes | str, os.stat_result] = {}

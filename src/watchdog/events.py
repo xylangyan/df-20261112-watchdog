@@ -66,6 +66,18 @@ Event Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: RecoveryBeginEvent
+   :members:
+   :show-inheritance:
+
+.. autoclass:: RecoveryEndEvent
+   :members:
+   :show-inheritance:
+
+.. autoclass:: ResyncRequiredEvent
+   :members:
+   :show-inheritance:
+
 
 Event Handler Classes
 ---------------------
@@ -118,6 +130,9 @@ EVENT_TYPE_CLOSED = "closed"
 EVENT_TYPE_CLOSED_NO_WRITE = "closed_no_write"
 EVENT_TYPE_OPENED = "opened"
 EVENT_TYPE_ATTRIB = "attrib"
+EVENT_TYPE_RECOVERY_BEGIN = "recovery_begin"
+EVENT_TYPE_RECOVERY_END = "recovery_end"
+EVENT_TYPE_RESYNC_REQUIRED = "resync_required"
 
 
 @dataclass(unsafe_hash=True)
@@ -142,11 +157,70 @@ class FileSystemEvent:
     are presumed to have happened based on other, actual events.
     """
 
+    def __post_init__(self) -> None:
+        """Finalize an event after the generated ``__init__`` ran.
+
+        Subclasses override this to force flags such as ``is_synthetic``,
+        which a plain class attribute cannot override because the dataclass
+        field assignment happens in the generated initializer.
+        """
+
 
 class FileSystemMovedEvent(FileSystemEvent):
     """File system event representing any kind of file system movement."""
 
     event_type = EVENT_TYPE_MOVED
+
+
+# Recovery marker events.
+#
+# These are synthetic events that do not describe a file system change but the
+# state of the watcher itself. They are plain ``FileSystemEvent`` subclasses,
+# so existing handlers keep working: the base ``FileSystemEventHandler``
+# dispatches them to ``on_recovery_begin`` / ``on_recovery_end`` /
+# ``on_resync_required`` (no-ops by default) in addition to ``on_any_event``.
+
+
+class RecoveryBeginEvent(FileSystemEvent):
+    """Marker emitted when overflow recovery starts.
+
+    ``src_path`` is the root of the watched tree being recovered. The
+    following events, up to the matching :class:`RecoveryEndEvent`, are
+    compensation events synthesized from a directory snapshot diff rather
+    than observed changes.
+    """
+
+    event_type = EVENT_TYPE_RECOVERY_BEGIN
+
+    def __post_init__(self) -> None:
+        self.is_synthetic = True
+
+
+class RecoveryEndEvent(FileSystemEvent):
+    """Marker emitted when overflow recovery finishes.
+
+    Events dispatched after this marker are live events again, observed
+    after the recovery snapshot was taken.
+    """
+
+    event_type = EVENT_TYPE_RECOVERY_END
+
+    def __post_init__(self) -> None:
+        self.is_synthetic = True
+
+
+class ResyncRequiredEvent(FileSystemEvent):
+    """Marker emitted when overflow recovery cannot produce a consistent snapshot.
+
+    The watched tree kept changing while it was being rescanned, so the
+    compensation events (if any) may not cover everything that was missed.
+    Consumers should perform a full rescan of ``src_path`` themselves.
+    """
+
+    event_type = EVENT_TYPE_RESYNC_REQUIRED
+
+    def __post_init__(self) -> None:
+        self.is_synthetic = True
 
 
 # File events.
@@ -355,6 +429,27 @@ class FileSystemEventHandler:
             Event representing file opening.
         :type event:
             :class:`watchdog.events.FileOpenedEvent`
+        """
+
+    def on_recovery_begin(self, event: RecoveryBeginEvent) -> None:
+        """Called when snapshot-based overflow recovery starts.
+
+        Defaults to a no-op so handlers that do not override it stay
+        compatible with the synthetic recovery markers.
+        """
+
+    def on_recovery_end(self, event: RecoveryEndEvent) -> None:
+        """Called when snapshot-based overflow recovery finishes.
+
+        Defaults to a no-op so handlers that do not override it stay
+        compatible with the synthetic recovery markers.
+        """
+
+    def on_resync_required(self, event: ResyncRequiredEvent) -> None:
+        """Called when a consistent recovery snapshot could not be obtained.
+
+        Defaults to a no-op; handlers may override it to trigger a full
+        resynchronization of the watched tree.
         """
 
 
