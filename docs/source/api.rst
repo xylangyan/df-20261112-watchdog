@@ -16,4 +16,5 @@ API Reference
    api/utils
    api/utils_dirsnapshot
    api/utils_event_debouncer
+   api/utils_file_ready_notifier
    api/tricks

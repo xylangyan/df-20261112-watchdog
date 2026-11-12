@@ -12,6 +12,7 @@ from watchdog.events import (
     EVENT_TYPE_MODIFIED,
     EVENT_TYPE_MOVED,
     EVENT_TYPE_OPENED,
+    EVENT_TYPE_READY,
     DirAttribEvent,
     DirCreatedEvent,
     DirDeletedEvent,
@@ -25,6 +26,7 @@ from watchdog.events import (
     FileModifiedEvent,
     FileMovedEvent,
     FileOpenedEvent,
+    FileReadyEvent,
     FileSystemEventHandler,
     generate_sub_moved_events,
 )
@@ -104,6 +106,14 @@ def test_file_opened_event():
     assert not event.is_synthetic
 
 
+def test_file_ready_event():
+    event = FileReadyEvent(path_1)
+    assert path_1 == event.src_path
+    assert event.event_type == EVENT_TYPE_READY
+    assert not event.is_directory
+    assert not event.is_synthetic
+
+
 def test_file_attrib_event():
     event = FileAttribEvent(path_1)
     assert path_1 == event.src_path
@@ -158,6 +168,7 @@ def test_file_system_event_handler_dispatch():
     file_mov_event = FileMovedEvent("/path/blah.txt", "/path/blah")
     file_attr_event = FileAttribEvent("/path/blah.py")
     dir_attr_event = DirAttribEvent("/path/dir")
+    file_ready_event = FileReadyEvent("/path/blah.txt")
 
     all_events = [
         dir_mod_event,
@@ -173,6 +184,7 @@ def test_file_system_event_handler_dispatch():
         file_opened_event,
         file_attr_event,
         dir_attr_event,
+        file_ready_event,
     ]
 
     checkpoint = 0
@@ -221,6 +233,11 @@ def test_file_system_event_handler_dispatch():
             nonlocal checkpoint
             checkpoint += 1
             assert event.event_type == EVENT_TYPE_ATTRIB
+
+        def on_ready(self, event):
+            nonlocal checkpoint
+            checkpoint += 1
+            assert event.event_type == EVENT_TYPE_READY
 
     handler = TestableEventHandler()
 

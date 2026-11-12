@@ -54,6 +54,10 @@ Event Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: FileReadyEvent
+   :members:
+   :show-inheritance:
+
 .. autoclass:: DirCreatedEvent
    :members:
    :show-inheritance:
@@ -118,6 +122,7 @@ EVENT_TYPE_CLOSED = "closed"
 EVENT_TYPE_CLOSED_NO_WRITE = "closed_no_write"
 EVENT_TYPE_OPENED = "opened"
 EVENT_TYPE_ATTRIB = "attrib"
+EVENT_TYPE_READY = "ready"
 
 
 @dataclass(unsafe_hash=True)
@@ -211,6 +216,18 @@ class FileOpenedEvent(FileSystemEvent):
     """
 
     event_type = EVENT_TYPE_OPENED
+
+
+class FileReadyEvent(FileSystemEvent):
+    """File system event representing a file that is ready to be consumed.
+
+    Unlike the other event classes, this event is never emitted by an
+    emitter: :class:`watchdog.utils.file_ready_notifier.FileReadyNotifier`
+    synthesizes it once a reported file's size and modification time have
+    remained stable for the configured settle interval.
+    """
+
+    event_type = EVENT_TYPE_READY
 
 
 # Directory events.
@@ -355,6 +372,18 @@ class FileSystemEventHandler:
             Event representing file opening.
         :type event:
             :class:`watchdog.events.FileOpenedEvent`
+        """
+
+    def on_ready(self, event: FileReadyEvent) -> None:
+        """Called when a file has settled and is ready to be consumed.
+
+        Only emitted by :class:`watchdog.utils.file_ready_notifier.FileReadyNotifier`,
+        which must be started explicitly and given the events to monitor.
+
+        :param event:
+            Event representing file readiness.
+        :type event:
+            :class:`watchdog.events.FileReadyEvent`
         """
 
 

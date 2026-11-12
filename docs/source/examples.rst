@@ -40,6 +40,14 @@ Text editors and build tools can emit several events for a single logical change
    :language: python
    :linenos:
 
+Waiting for Complete Files
+--------------------------
+Some producers write files directly into the watched directory. Reacting to the first event then risks reading a half-written file. Schedule :class:`watchdog.utils.file_ready_notifier.FileReadyNotifier` instead of your handler: it forwards all events unchanged and additionally calls ``on_ready()`` once a file's size and modification time have stayed stable for the given interval. Stability is evaluated per file, so files in the same directory are reported independently.
+
+.. literalinclude:: examples/ready.py
+   :language: python
+   :linenos:
+
 Organizing Files by Type
 ------------------------
 A common task is to keep a busy directory (such as a ``Downloads`` folder) tidy by automatically moving newly created files into category subfolders based on their file extension:

@@ -8,6 +8,10 @@ Changelog
 
 2026-xx-xx • `full history <https://github.com/gorakhargosh/watchdog/compare/v7.1.0...HEAD>`__
 
+**New Features**
+
+- [core] Add :class:`watchdog.utils.file_ready_notifier.FileReadyNotifier`, an optional event handler that forwards events unchanged and additionally emits :class:`watchdog.events.FileReadyEvent` (``on_ready()``) once a file's size and modification time have stayed stable for a configurable interval. Stability is tracked per file; pending checks are cancelled when the file is deleted or renamed, and dropped without notification when the notifier is stopped.
+
 **Other Changes**
 
 - [kqueue] Stop the emitter with a ``DirDeletedEvent`` when the watched directory is removed or moved, instead of letting its thread die with ``FileNotFoundError``. The kevents read in the same batch are still reported. (`#1436 <https://github.com/gorakhargosh/watchdog/issues/1436>`__, thanks to @karolyi)
